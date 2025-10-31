@@ -1,0 +1,200 @@
+name: Deploy to Modal - Experimental
+
+# Experimental deployment workflow with alternative approach
+# This workflow uses a different deployment method for testing purposes
+on:
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Enable test mode (sandbox)'
+        required: false
+        default: true
+        type: boolean
+      modal_version:
+        description: 'Modal SDK version'
+        required: false
+        default: 'latest'
+        type: string
+  push:
+    branches: [experimental, feature/*]
+    paths:
+      - 'modal_app.py'
+      - 'deploy.py'
+      - '.github/workflows/deploy-experimental.yml'
+
+# Concurrency control for experimental deployments
+concurrency:
+  group: 'deploy-experimental-${{ github.ref }}'
+  cancel-in-progress: true
+
+# Least privilege permissions
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Check for deploy.py
+        run: |
+          if [[ ! -f "deploy.py" ]]; then
+            echo "❌ deploy.py not found. This workflow requires a deploy.py file."
+            echo "💡 Create a deploy.py file or use the production workflow instead."
+            exit 1
+          fi
+          echo "✅ deploy.py found"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 10
+
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      MODAL_USER_NAME: ${{ secrets.MODAL_USER_NAME }}
+      MODAL_APP_NAME: ${{ secrets.MODAL_APP_NAME || 'proxy-app-experimental' }}
+      MODAL_CONFIG_DIR: /home/runner/.modal
+      TEST_MODE: ${{ github.event.inputs.test_mode || 'true' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        # Note: Removed explicit branch checkout - uses default branch
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'  # Aligned with production
+
+      - name: Install Modal SDK
+        run: |
+          MODAL_VERSION="${{ github.event.inputs.modal_version || 'latest' }}"
+          if [[ "$MODAL_VERSION" == "latest" ]]; then
+            pip install --no-cache-dir --upgrade modal
+          else
+            pip install --no-cache-dir "modal==$MODAL_VERSION"
+          fi
+          echo "✅ Modal SDK installed"
+
+      - name: Check Modal version
+        run: |
+          python -c "import modal; print(f'📦 Modal version: {modal.__version__}')"
+
+      - name: Validate Required Secrets
+        run: |
+          missing_secrets=()
+          
+          [[ -z "${{ secrets.MODAL_TOKEN_ID }}" ]] && missing_secrets+=("MODAL_TOKEN_ID")
+          [[ -z "${{ secrets.MODAL_TOKEN_SECRET }}" ]] && missing_secrets+=("MODAL_TOKEN_SECRET")
+          [[ -z "${{ secrets.MODAL_USER_NAME }}" ]] && missing_secrets+=("MODAL_USER_NAME")
+          
+          if [[ ${#missing_secrets[@]} -gt 0 ]]; then
+            echo "❌ Missing required secrets: ${missing_secrets[*]}"
+            exit 1
+          fi
+          echo "✅ All required secrets are present"
+
+      - name: Inject Modal Token
+        run: |
+          echo "🔐 Setting up Modal authentication..."
+          mkdir -p $MODAL_CONFIG_DIR
+          
+          # Create token.toml with proper formatting
+          printf '[default]\ntoken_id = "%s"\ntoken_secret = "%s"\n' "$MODAL_TOKEN_ID" "$MODAL_TOKEN_SECRET" > $MODAL_CONFIG_DIR/token.toml
+          
+          echo "✅ Modal token configured"
+          # Verify the file was created correctly
+          cat $MODAL_CONFIG_DIR/token.toml
+
+      - name: Validate Modal Connection
+        run: |
+          echo "🔍 Testing Modal connection..."
+          if modal whoami > /dev/null 2>&1; then
+            echo "✅ Modal connection successful"
+          else
+            echo "❌ Modal connection failed"
+            exit 1
+          fi
+
+      - name: Run Experimental Deployment
+        run: |
+          echo "🧪 Starting experimental deployment..."
+          echo "📋 Deployment config:"
+          echo "  Test Mode: ${{ env.TEST_MODE }}"
+          echo "  App Name: ${{ env.MODAL_APP_NAME }}"
+          echo "  User Name: ${{ env.MODAL_USER_NAME }}"
+          
+          # Check if deploy.py exists and is executable
+          if [[ ! -f "deploy.py" ]]; then
+            echo "❌ deploy.py not found in repository root"
+            echo "💡 Please create deploy.py or use deploy-production.yml"
+            exit 1
+          fi
+          
+          # Run deployment with test mode flag if enabled
+          if [[ "${{ env.TEST_MODE }}" == "true" ]]; then
+            echo "🔬 Running in test/sandbox mode..."
+            python deploy.py --sandbox --app-name "${{ env.MODAL_APP_NAME }}"
+          else
+            echo "🚀 Running in production mode..."
+            python deploy.py --app-name "${{ env.MODAL_APP_NAME }}"
+          fi
+          
+          echo "✅ Experimental deployment completed"
+
+      - name: Verify Experimental Deployment
+        if: always()
+        run: |
+          echo "🏥 Verifying experimental deployment..."
+          
+          # Try to get app status
+          if modal app list | grep -q "${{ env.MODAL_APP_NAME }}"; then
+            echo "✅ App found in Modal app list"
+            
+            # Optional health check if not in test mode
+            if [[ "${{ env.TEST_MODE }}" != "true" ]]; then
+              APP_URL="https://${{ env.MODAL_USER_NAME }}--${{ env.MODAL_APP_NAME }}-web_server.modal.run"
+              echo "🔗 Testing app URL: $APP_URL"
+              
+              if curl -f -s "$APP_URL" > /dev/null; then
+                echo "✅ Experimental deployment health check passed"
+              else
+                echo "⚠️ Experimental deployment health check failed"
+              fi
+            fi
+          else
+            echo "⚠️ App not found in Modal (this may be expected for test deployments)"
+          fi
+
+      - name: Cleanup Test Resources
+        if: env.TEST_MODE == 'true' && always()
+        run: |
+          echo "🧹 Cleaning up test resources..."
+          # Optionally stop test apps to avoid resource usage
+          if [[ "${{ env.TEST_MODE }}" == "true" ]]; then
+            modal app stop ${{ env.MODAL_APP_NAME }} || echo "⚠️ No test app to stop"
+            echo "✅ Test resources cleaned up"
+          fi
+
+      - name: Output Experimental Results
+        if: always()
+        run: |
+          echo "🧪 Experimental deployment workflow completed!"
+          echo "=" * 50
+          echo "📋 Summary:"
+          echo "  Status: ${{ job.status }}"
+          echo "  Test Mode: ${{ env.TEST_MODE }}"
+          echo "  App Name: ${{ env.MODAL_APP_NAME }}"
+          echo ""
+          if [[ "${{ env.TEST_MODE }}" != "true" ]]; then
+            echo "🔗 URLs (if deployment succeeded):"
+            echo "  Project URL: https://${{ env.MODAL_USER_NAME }}--${{ env.MODAL_APP_NAME }}-web_server.modal.run"
+            echo "  Subscription URL: https://${{ env.MODAL_USER_NAME }}--${{ env.MODAL_APP_NAME }}-web_server.modal.run/sub"
+          fi
+          echo "=" * 50
+          echo "💡 Use the production workflow (deploy-production.yml) for stable deployments"
